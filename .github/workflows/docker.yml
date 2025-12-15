@@ -6,8 +6,8 @@ on:
       - "v*"
 
 env:
-  IMAGE_NAME: outlinewiki/outline
-  BASE_IMAGE_NAME: outlinewiki/outline-base
+  IMAGE_NAME: 54687315/outline
+  BASE_IMAGE_NAME: 54687315/outline-base
 
 jobs:
   build-arm:
