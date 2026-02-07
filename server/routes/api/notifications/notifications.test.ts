@@ -1,5 +1,5 @@
 import queryString from "query-string";
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import { randomElement } from "@shared/random";
 import { NotificationEventType } from "@shared/types";
 import NotificationSettingsHelper from "@server/models/helpers/NotificationSettingsHelper";
@@ -719,7 +719,7 @@ describe("#notifications.unsubscribe", () => {
     );
 
     const events = (await user.reload()).notificationSettings;
-    expect(events).not.toContain("documents.update");
+    expect(events["documents.update"]).toBe(false);
   });
 
   it("should not allow unsubscribe with invalid token", async () => {

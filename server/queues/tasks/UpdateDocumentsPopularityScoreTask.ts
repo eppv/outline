@@ -1,11 +1,13 @@
-import crypto from "crypto";
+import crypto from "node:crypto";
+import { setTimeout } from "node:timers/promises";
 import { subWeeks } from "date-fns";
 import { QueryTypes } from "sequelize";
 import { Minute } from "@shared/utils/time";
 import env from "@server/env";
 import Logger from "@server/logging/Logger";
 import { TaskPriority } from "./base/BaseTask";
-import { CronTask, PartitionInfo, Props, TaskInterval } from "./base/CronTask";
+import type { PartitionInfo, Props } from "./base/CronTask";
+import { CronTask, TaskInterval } from "./base/CronTask";
 import { sequelize, sequelizeReadOnly } from "@server/storage/database";
 
 /**
@@ -25,9 +27,14 @@ const ACTIVITY_WEIGHTS = {
 };
 
 /**
- * Batch size for processing updates - kept small to minimize query duration
+ * Batch size for processing updates - kept small to minimize lock contention
  */
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 100;
+
+/**
+ * Delay between batches in milliseconds to reduce sustained database pressure
+ */
+const INTER_BATCH_DELAY_MS = 500;
 
 /**
  * Statement timeout for individual queries to prevent runaway locks
@@ -65,8 +72,9 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
     const threshold = subWeeks(now, env.POPULARITY_ACTIVITY_THRESHOLD_WEEKS);
 
     // Generate unique table name for this run to prevent conflicts
-    const uniqueId = crypto.randomBytes(8).toString("hex");
-    this.workingTable = `${WORKING_TABLE_PREFIX}_${uniqueId}`;
+    const dateStr = now.toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const uniqueId = crypto.randomBytes(4).toString("hex");
+    this.workingTable = `${WORKING_TABLE_PREFIX}_${dateStr}_${uniqueId}`;
 
     try {
       // Setup: Create working table and populate with active document IDs
@@ -105,6 +113,11 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
             "task",
             `Batch ${batchNumber}: updated ${updated} documents, ${remaining - updated} remaining`
           );
+
+          // Add delay between batches to reduce sustained pressure on the database
+          if (remaining - updated > 0) {
+            await setTimeout(INTER_BATCH_DELAY_MS);
+          }
         } catch (error) {
           totalErrors++;
           Logger.error(`Batch ${batchNumber} failed after retries`, error);
@@ -150,31 +163,66 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
     const [startUuid, endUuid] = this.getPartitionBounds(partition);
 
     // Populate with documents that have recent activity and are valid
-    // (published, not deleted). Using JOINs to filter upfront.
-    await sequelize.query(
-      `
-      INSERT INTO ${this.workingTable} ("documentId")
-      SELECT DISTINCT d.id
-      FROM documents d
-      WHERE d."publishedAt" IS NOT NULL
-        AND d."deletedAt" IS NULL
-        AND (
-          EXISTS (
-            SELECT 1 FROM revisions r
-            WHERE r."documentId" = d.id AND r."createdAt" >= :threshold
+    // (published, not deleted). Process in chunks to avoid long-running queries.
+    let lastId = startUuid;
+    let insertedCount = 0;
+    const chunkSize = 1000;
+
+    while (true) {
+      const result = await sequelize.query<{ documentId: string }>(
+        `
+        INSERT INTO ${this.workingTable} ("documentId")
+        SELECT d.id
+        FROM documents d
+        WHERE d."publishedAt" IS NOT NULL
+          AND d."deletedAt" IS NULL
+          ${lastId ? (insertedCount === 0 ? "AND d.id >= :lastId" : "AND d.id > :lastId") : ""}
+          ${endUuid ? "AND d.id <= :endUuid" : ""}
+          AND (
+            EXISTS (
+              SELECT 1 FROM revisions r
+              WHERE r."documentId" = d.id AND r."createdAt" >= :threshold
+            )
+            OR EXISTS (
+              SELECT 1 FROM comments c
+              WHERE c."documentId" = d.id AND c."createdAt" >= :threshold
+            )
+            OR EXISTS (
+              SELECT 1 FROM views v
+              WHERE v."documentId" = d.id AND v."updatedAt" >= :threshold
+            )
           )
-          OR EXISTS (
-            SELECT 1 FROM comments c
-            WHERE c."documentId" = d.id AND c."createdAt" >= :threshold
-          )
-          OR EXISTS (
-            SELECT 1 FROM views v
-            WHERE v."documentId" = d.id AND v."updatedAt" >= :threshold
-          )
-        )
-        ${startUuid && endUuid ? "AND d.id >= :startUuid AND d.id <= :endUuid" : ""}
-      `,
-      { replacements: { threshold, startUuid, endUuid } }
+        ORDER BY d.id
+        LIMIT :limit
+        ON CONFLICT ("documentId") DO NOTHING
+        RETURNING "documentId"
+        `,
+        {
+          replacements: {
+            threshold,
+            lastId,
+            endUuid,
+            limit: chunkSize,
+          },
+          type: QueryTypes.SELECT,
+        }
+      );
+
+      if (result.length === 0) {
+        break;
+      }
+
+      insertedCount += result.length;
+      lastId = result[result.length - 1].documentId;
+
+      if (result.length < chunkSize) {
+        break;
+      }
+    }
+
+    Logger.debug(
+      "task",
+      `Populated working table with ${insertedCount} documents in ${Math.ceil(insertedCount / chunkSize)} chunks`
     );
 
     // Create index on processed column for efficient batch selection
@@ -243,74 +291,82 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
     threshold: Date,
     now: Date
   ): Promise<DocumentScore[]> {
-    const results = await sequelizeReadOnly.query<{
-      documentId: string;
-      total_score: string;
-    }>(
-      `
-      SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms';
+    const results = await sequelizeReadOnly.transaction(async (transaction) => {
+      // Set statement timeout within the transaction - this prevents any single
+      // query from running too long and holding resources
+      await sequelizeReadOnly.query(
+        `SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms'`,
+        { transaction }
+      );
 
-      WITH batch_docs AS (
-        SELECT unnest(ARRAY[:documentIds]::uuid[]) AS id
-      ),
-      revision_scores AS (
+      return sequelizeReadOnly.query<{
+        documentId: string;
+        total_score: string;
+      }>(
+        `
+        WITH batch_docs AS (
+          SELECT * FROM unnest(ARRAY[:documentIds]::uuid[]) AS t(id)
+        ),
+        revision_scores AS (
+          SELECT
+            r."documentId",
+            SUM(:revisionWeight / POWER(
+              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - r."createdAt")) / 3600 + :timeOffset, 0.1),
+              :gravity
+            )) as score
+          FROM revisions r
+          INNER JOIN batch_docs bd ON r."documentId" = bd.id
+          WHERE r."createdAt" >= :threshold
+          GROUP BY r."documentId"
+        ),
+        comment_scores AS (
+          SELECT
+            c."documentId",
+            SUM(:commentWeight / POWER(
+              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - c."createdAt")) / 3600 + :timeOffset, 0.1),
+              :gravity
+            )) as score
+          FROM comments c
+          INNER JOIN batch_docs bd ON c."documentId" = bd.id
+          WHERE c."createdAt" >= :threshold
+          GROUP BY c."documentId"
+        ),
+        view_scores AS (
+          SELECT
+            v."documentId",
+            SUM(:viewWeight / POWER(
+              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - v."updatedAt")) / 3600 + :timeOffset, 0.1),
+              :gravity
+            )) as score
+          FROM views v
+          INNER JOIN batch_docs bd ON v."documentId" = bd.id
+          WHERE v."updatedAt" >= :threshold
+          GROUP BY v."documentId"
+        )
         SELECT
-          r."documentId",
-          SUM(:revisionWeight / POWER(
-            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - r."createdAt")) / 3600 + :timeOffset, 0.1),
-            :gravity
-          )) as score
-        FROM revisions r
-        INNER JOIN batch_docs bd ON r."documentId" = bd.id
-        WHERE r."createdAt" >= :threshold
-        GROUP BY r."documentId"
-      ),
-      comment_scores AS (
-        SELECT
-          c."documentId",
-          SUM(:commentWeight / POWER(
-            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - c."createdAt")) / 3600 + :timeOffset, 0.1),
-            :gravity
-          )) as score
-        FROM comments c
-        INNER JOIN batch_docs bd ON c."documentId" = bd.id
-        WHERE c."createdAt" >= :threshold
-        GROUP BY c."documentId"
-      ),
-      view_scores AS (
-        SELECT
-          v."documentId",
-          SUM(:viewWeight / POWER(
-            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - v."updatedAt")) / 3600 + :timeOffset, 0.1),
-            :gravity
-          )) as score
-        FROM views v
-        INNER JOIN batch_docs bd ON v."documentId" = bd.id
-        WHERE v."updatedAt" >= :threshold
-        GROUP BY v."documentId"
-      )
-      SELECT
-        bd.id as "documentId",
-        COALESCE(rs.score, 0) + COALESCE(cs.score, 0) + COALESCE(vs.score, 0) as total_score
-      FROM batch_docs bd
-      LEFT JOIN revision_scores rs ON bd.id = rs."documentId"
-      LEFT JOIN comment_scores cs ON bd.id = cs."documentId"
-      LEFT JOIN view_scores vs ON bd.id = vs."documentId"
-      `,
-      {
-        replacements: {
-          documentIds,
-          threshold,
-          now,
-          gravity: env.POPULARITY_GRAVITY,
-          timeOffset: TIME_OFFSET_HOURS,
-          revisionWeight: ACTIVITY_WEIGHTS.revision,
-          commentWeight: ACTIVITY_WEIGHTS.comment,
-          viewWeight: ACTIVITY_WEIGHTS.view,
-        },
-        type: QueryTypes.SELECT,
-      }
-    );
+          bd.id as "documentId",
+          COALESCE(rs.score, 0) + COALESCE(cs.score, 0) + COALESCE(vs.score, 0) as total_score
+        FROM batch_docs bd
+        LEFT JOIN revision_scores rs ON bd.id = rs."documentId"
+        LEFT JOIN comment_scores cs ON bd.id = cs."documentId"
+        LEFT JOIN view_scores vs ON bd.id = vs."documentId"
+        `,
+        {
+          replacements: {
+            documentIds,
+            threshold,
+            now,
+            gravity: env.POPULARITY_GRAVITY,
+            timeOffset: TIME_OFFSET_HOURS,
+            revisionWeight: ACTIVITY_WEIGHTS.revision,
+            commentWeight: ACTIVITY_WEIGHTS.comment,
+            viewWeight: ACTIVITY_WEIGHTS.view,
+          },
+          type: QueryTypes.SELECT,
+          transaction,
+        }
+      );
+    });
 
     return results.map((r) => ({
       documentId: r.documentId,
@@ -323,20 +379,28 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
    * Uses individual updates to minimize lock duration and contention.
    */
   private async updateDocumentScores(scores: DocumentScore[]): Promise<void> {
-    // Update documents one at a time with short statement timeout
-    // This prevents any single update from holding locks for too long
-    for (const { documentId, score } of scores) {
-      await sequelize.query(
-        `
-        UPDATE documents
-        SET "popularityScore" = :score
-        WHERE id = :documentId
-        `,
-        {
-          replacements: { documentId, score },
-        }
-      );
+    if (scores.length === 0) {
+      return;
     }
+
+    // Update documents in a single batch to improve performance and reduce round-trips.
+    // We use unnest with multiple arrays to ensure the IDs and scores stay aligned.
+    await sequelize.query(
+      `
+      UPDATE documents AS d
+      SET "popularityScore" = s.score
+      FROM (
+        SELECT * FROM unnest(ARRAY[:ids]::uuid[], ARRAY[:scores]::double precision[]) AS s(id, score)
+      ) AS s
+      WHERE d.id = s.id
+      `,
+      {
+        replacements: {
+          ids: scores.map((s) => s.documentId),
+          scores: scores.map((s) => s.score),
+        },
+      }
+    );
   }
 
   /**
@@ -347,7 +411,7 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
       `
       UPDATE ${this.workingTable}
       SET processed = TRUE
-      WHERE "documentId" IN (SELECT unnest(ARRAY[:documentIds]::uuid[]))
+      WHERE "documentId" = ANY(ARRAY[:documentIds]::uuid[])
       `,
       {
         replacements: { documentIds },

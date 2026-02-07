@@ -1,6 +1,7 @@
 import { createGlobalStyle } from "styled-components";
 import styledNormalize from "styled-normalize";
 import { breakpoints, depths, s } from ".";
+import { EditorStyleHelper } from "../editor/styles/EditorStyleHelper";
 
 type Props = {
   staticHTML?: boolean;
@@ -14,6 +15,11 @@ export default createGlobalStyle<Props>`
     box-sizing: border-box;
   }
 
+  html {
+    --line-height-body: 1.5;
+    --font-size-body: 16px;
+  }
+
   html,
   body {
     width: 100%;
@@ -22,11 +28,15 @@ export default createGlobalStyle<Props>`
     padding: 0;
     print-color-adjust: exact;
     --pointer: ${(props) => (props.useCursorPointer ? "pointer" : "default")};
+    --scrollbar-width: calc(100vw - 100cqw);
     overscroll-behavior-x: none;
 
     @media print {
       background: none !important;
     }
+
+    --line-height-p: var(--line-height-body);
+    --line-height-h: 1.25;
   }
 
   body,
@@ -39,8 +49,8 @@ export default createGlobalStyle<Props>`
   }
 
   body {
-    font-size: 16px;
-    line-height: 1.5;
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
     color: ${s("text")};
     overscroll-behavior-y: none;
     -moz-osx-font-smoothing: grayscale;
@@ -86,7 +96,7 @@ export default createGlobalStyle<Props>`
   h5,
   h6 {
     font-weight: 500;
-    line-height: 1.25;
+    line-height: var(--line-height-h);
     margin-top: 1em;
     margin-bottom: 0.5em;
   }
@@ -130,5 +140,13 @@ export default createGlobalStyle<Props>`
       position: absolute !important;
       left: -9999px !important;
       top: -9999px !important;
+  }
+
+  /* Table row/column drag and drop cursor */
+  &.${EditorStyleHelper.tableDragging},
+  &.${EditorStyleHelper.tableDragging} *,
+  &.${EditorStyleHelper.tableDragging} *::before,
+  &.${EditorStyleHelper.tableDragging} *::after {
+    cursor: grabbing !important;
   }
 `;

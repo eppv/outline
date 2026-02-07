@@ -1,11 +1,12 @@
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import {
   FileOperationFormat,
   FileOperationType,
   FileOperationState,
 } from "@shared/types";
 import { traceFunction } from "@server/logging/tracing";
-import { Collection, Team, User, FileOperation } from "@server/models";
+import type { Collection, Team, User } from "@server/models";
+import { FileOperation } from "@server/models";
 import { Buckets } from "@server/models/helpers/AttachmentHelper";
 import { type APIContext } from "@server/types";
 
