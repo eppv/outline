@@ -37,11 +37,6 @@ const BATCH_SIZE = 100;
 const INTER_BATCH_DELAY_MS = 500;
 
 /**
- * Statement timeout for individual queries to prevent runaway locks
- */
-const STATEMENT_TIMEOUT_MS = 30000;
-
-/**
  * Base name for the working table used to track documents to process
  */
 const WORKING_TABLE_PREFIX = "popularity_score_working";
@@ -58,12 +53,12 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
   private workingTable: string = "";
 
   public async perform({ partition }: Props) {
-    // Only run every 6 hours (at hours 0, 6, 12, 18)
+    // Only run every X hours, skip other hours
     const currentHour = new Date().getHours();
-    if (currentHour % 6 !== 0) {
+    if (currentHour % env.POPULARITY_UPDATE_INTERVAL_HOURS !== 0) {
       Logger.debug(
         "task",
-        `Skipping popularity score update, will run at next 6-hour interval (current hour: ${currentHour})`
+        `Skipping popularity score update, will run at next ${env.POPULARITY_UPDATE_INTERVAL_HOURS}-hour interval (current hour: ${currentHour})`
       );
       return;
     }
@@ -77,6 +72,9 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
     this.workingTable = `${WORKING_TABLE_PREFIX}_${dateStr}_${uniqueId}`;
 
     try {
+      // Clean up any stale working tables left behind by previous crashed runs
+      await this.cleanupStaleWorkingTables();
+
       // Setup: Create working table and populate with active document IDs
       await this.setupWorkingTable(threshold, partition);
 
@@ -164,14 +162,15 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
 
     // Populate with documents that have recent activity and are valid
     // (published, not deleted). Process in chunks to avoid long-running queries.
+    // Read from replica to avoid excessive locking on primary.
     let lastId = startUuid;
     let insertedCount = 0;
     const chunkSize = 1000;
 
     while (true) {
-      const result = await sequelize.query<{ documentId: string }>(
+      // Step 1: Read document IDs from readonly replica to avoid locking
+      const documentIds = await sequelizeReadOnly.query<{ id: string }>(
         `
-        INSERT INTO ${this.workingTable} ("documentId")
         SELECT d.id
         FROM documents d
         WHERE d."publishedAt" IS NOT NULL
@@ -194,8 +193,6 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
           )
         ORDER BY d.id
         LIMIT :limit
-        ON CONFLICT ("documentId") DO NOTHING
-        RETURNING "documentId"
         `,
         {
           replacements: {
@@ -208,14 +205,29 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
         }
       );
 
-      if (result.length === 0) {
+      if (documentIds.length === 0) {
         break;
       }
 
-      insertedCount += result.length;
-      lastId = result[result.length - 1].documentId;
+      // Step 2: Insert the IDs into the working table on primary
+      const ids = documentIds.map((d) => d.id);
+      const result = await sequelize.query<{ documentId: string }>(
+        `
+        INSERT INTO ${this.workingTable} ("documentId")
+        SELECT * FROM unnest(ARRAY[:ids]::uuid[])
+        ON CONFLICT ("documentId") DO NOTHING
+        RETURNING "documentId"
+        `,
+        {
+          replacements: { ids },
+          type: QueryTypes.SELECT,
+        }
+      );
 
-      if (result.length < chunkSize) {
+      insertedCount += result.length;
+      lastId = documentIds[documentIds.length - 1].id;
+
+      if (documentIds.length < chunkSize) {
         break;
       }
     }
@@ -291,82 +303,72 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
     threshold: Date,
     now: Date
   ): Promise<DocumentScore[]> {
-    const results = await sequelizeReadOnly.transaction(async (transaction) => {
-      // Set statement timeout within the transaction - this prevents any single
-      // query from running too long and holding resources
-      await sequelizeReadOnly.query(
-        `SET LOCAL statement_timeout = '${STATEMENT_TIMEOUT_MS}ms'`,
-        { transaction }
-      );
-
-      return sequelizeReadOnly.query<{
-        documentId: string;
-        total_score: string;
-      }>(
-        `
-        WITH batch_docs AS (
-          SELECT * FROM unnest(ARRAY[:documentIds]::uuid[]) AS t(id)
-        ),
-        revision_scores AS (
-          SELECT
-            r."documentId",
-            SUM(:revisionWeight / POWER(
-              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - r."createdAt")) / 3600 + :timeOffset, 0.1),
-              :gravity
-            )) as score
-          FROM revisions r
-          INNER JOIN batch_docs bd ON r."documentId" = bd.id
-          WHERE r."createdAt" >= :threshold
-          GROUP BY r."documentId"
-        ),
-        comment_scores AS (
-          SELECT
-            c."documentId",
-            SUM(:commentWeight / POWER(
-              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - c."createdAt")) / 3600 + :timeOffset, 0.1),
-              :gravity
-            )) as score
-          FROM comments c
-          INNER JOIN batch_docs bd ON c."documentId" = bd.id
-          WHERE c."createdAt" >= :threshold
-          GROUP BY c."documentId"
-        ),
-        view_scores AS (
-          SELECT
-            v."documentId",
-            SUM(:viewWeight / POWER(
-              GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - v."updatedAt")) / 3600 + :timeOffset, 0.1),
-              :gravity
-            )) as score
-          FROM views v
-          INNER JOIN batch_docs bd ON v."documentId" = bd.id
-          WHERE v."updatedAt" >= :threshold
-          GROUP BY v."documentId"
-        )
+    const results = await sequelizeReadOnly.query<{
+      documentId: string;
+      total_score: string;
+    }>(
+      `
+      WITH batch_docs AS (
+        SELECT * FROM unnest(ARRAY[:documentIds]::uuid[]) AS t(id)
+      ),
+      revision_scores AS (
         SELECT
-          bd.id as "documentId",
-          COALESCE(rs.score, 0) + COALESCE(cs.score, 0) + COALESCE(vs.score, 0) as total_score
-        FROM batch_docs bd
-        LEFT JOIN revision_scores rs ON bd.id = rs."documentId"
-        LEFT JOIN comment_scores cs ON bd.id = cs."documentId"
-        LEFT JOIN view_scores vs ON bd.id = vs."documentId"
-        `,
-        {
-          replacements: {
-            documentIds,
-            threshold,
-            now,
-            gravity: env.POPULARITY_GRAVITY,
-            timeOffset: TIME_OFFSET_HOURS,
-            revisionWeight: ACTIVITY_WEIGHTS.revision,
-            commentWeight: ACTIVITY_WEIGHTS.comment,
-            viewWeight: ACTIVITY_WEIGHTS.view,
-          },
-          type: QueryTypes.SELECT,
-          transaction,
-        }
-      );
-    });
+          r."documentId",
+          SUM(:revisionWeight / POWER(
+            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - r."createdAt")) / 3600 + :timeOffset, 0.1),
+            :gravity
+          )) as score
+        FROM revisions r
+        INNER JOIN batch_docs bd ON r."documentId" = bd.id
+        WHERE r."createdAt" >= :threshold
+        GROUP BY r."documentId"
+      ),
+      comment_scores AS (
+        SELECT
+          c."documentId",
+          SUM(:commentWeight / POWER(
+            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - c."createdAt")) / 3600 + :timeOffset, 0.1),
+            :gravity
+          )) as score
+        FROM comments c
+        INNER JOIN batch_docs bd ON c."documentId" = bd.id
+        WHERE c."createdAt" >= :threshold
+        GROUP BY c."documentId"
+      ),
+      view_scores AS (
+        SELECT
+          v."documentId",
+          SUM(:viewWeight / POWER(
+            GREATEST(EXTRACT(EPOCH FROM (:now::timestamp - v."updatedAt")) / 3600 + :timeOffset, 0.1),
+            :gravity
+          )) as score
+        FROM views v
+        INNER JOIN batch_docs bd ON v."documentId" = bd.id
+        WHERE v."updatedAt" >= :threshold
+        GROUP BY v."documentId"
+      )
+      SELECT
+        bd.id as "documentId",
+        COALESCE(rs.score, 0) + COALESCE(cs.score, 0) + COALESCE(vs.score, 0) as total_score
+      FROM batch_docs bd
+      LEFT JOIN revision_scores rs ON bd.id = rs."documentId"
+      LEFT JOIN comment_scores cs ON bd.id = cs."documentId"
+      LEFT JOIN view_scores vs ON bd.id = vs."documentId"
+      `,
+      {
+        replacements: {
+          documentIds,
+          threshold,
+          now,
+          gravity: env.POPULARITY_GRAVITY,
+          timeOffset: TIME_OFFSET_HOURS,
+          revisionWeight: ACTIVITY_WEIGHTS.revision,
+          commentWeight: ACTIVITY_WEIGHTS.comment,
+          viewWeight: ACTIVITY_WEIGHTS.view,
+        },
+        type: QueryTypes.SELECT,
+      }
+    );
 
     return results.map((r) => ({
       documentId: r.documentId,
@@ -385,14 +387,19 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
 
     // Update documents in a single batch to improve performance and reduce round-trips.
     // We use unnest with multiple arrays to ensure the IDs and scores stay aligned.
+    // We also use SKIP LOCKED to avoid waiting on locked rows from other concurrent tasks.
     await sequelize.query(
       `
+      WITH lockable AS (
+        SELECT id FROM documents WHERE id = ANY(ARRAY[:ids]::uuid[]) FOR UPDATE SKIP LOCKED
+      )
       UPDATE documents AS d
       SET "popularityScore" = s.score
       FROM (
         SELECT * FROM unnest(ARRAY[:ids]::uuid[], ARRAY[:scores]::double precision[]) AS s(id, score)
       ) AS s
       WHERE d.id = s.id
+      AND d.id IN (SELECT id FROM lockable)
       `,
       {
         replacements: {
@@ -437,6 +444,41 @@ export default class UpdateDocumentsPopularityScoreTask extends CronTask {
       `,
       { replacements: { limit: BATCH_SIZE } }
     );
+  }
+
+  /**
+   * Drops any stale working tables from previous dates that were left behind
+   * by runs interrupted before cleanup could occur (e.g. worker killed mid-run).
+   * Only removes tables from before the current date to avoid race conditions
+   * with concurrent runs.
+   */
+  private async cleanupStaleWorkingTables(): Promise<void> {
+    try {
+      const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      const tables = await sequelize.query<{ tablename: string }>(
+        `SELECT tablename FROM pg_tables
+         WHERE schemaname = 'public'
+           AND tablename LIKE :prefix`,
+        {
+          replacements: {
+            prefix: `${WORKING_TABLE_PREFIX}%`,
+          },
+          type: QueryTypes.SELECT,
+        }
+      );
+
+      const prefixLen = WORKING_TABLE_PREFIX.length + 1; // +1 for underscore
+
+      for (const { tablename } of tables) {
+        const dateStr = tablename.slice(prefixLen, prefixLen + 8);
+        if (dateStr < todayStr) {
+          Logger.info("task", `Dropping stale working table: ${tablename}`);
+          await sequelize.query(`DROP TABLE IF EXISTS "${tablename}" CASCADE`);
+        }
+      }
+    } catch (error) {
+      Logger.warn("Failed to clean up stale working tables", { error });
+    }
   }
 
   /**
